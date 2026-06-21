@@ -1,0 +1,4 @@
+# Dependencies are resolved by Pi at runtime; nothing to install in this repo.
+node_modules/
+*.log
+.DS_Store
