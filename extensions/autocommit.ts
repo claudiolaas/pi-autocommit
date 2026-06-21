@@ -14,6 +14,13 @@
  *   conflict markers.
  * - If the model call cannot happen (no model / no API key) or fails, it falls
  *   back to a short subject derived from the assistant's last response.
+ * - The commit-message model call is a STANDALONE call (pi-ai `complete()`); it
+ *   does not touch the Pi session, so it never produces a visible agent turn.
+ * - Success is reported in the FOOTER status line ("\u2713 autocommit: <subject>"),
+ *   not as an inline notification, so the autocommit flow stays out of the main
+ *   conversation thread. The indicator is cleared at the start of the next
+ *   prompt. Errors/warnings (conflicts, suspended with pending changes, commit
+ *   failures) still notify inline so they are not missed.
  * - Failures never interrupt the agent; they are surfaced via notifications.
  *
  * Toggle (persisted per project):
@@ -45,6 +52,7 @@ const DIFF_MAX_BYTES = 8000;
 const DIFF_MAX_LINES = 200;
 const GIT_TIMEOUT_MS = 30_000;
 const STATE_DIR_NAME = "autocommit-state";
+const FOOTER_SUBJECT_MAX = 60;
 
 interface GitResult {
 	code: number;
@@ -101,13 +109,28 @@ async function writeState(cwd: string, value: boolean): Promise<void> {
 	await writeFile(file, `${JSON.stringify({ enabled: value } satisfies AutocommitState, null, 2)}\n`, "utf8");
 }
 
-/** Show/clear the "paused" footer status (TUI/RPC only). */
-function applyStatus(ctx: ExtensionContext): void {
+/** Truncate a commit subject for the narrow footer status line. */
+function truncateForFooter(s: string, max: number): string {
+	const t = s.trim();
+	if (t.length <= max) return t;
+	const cut = t.slice(0, max - 1);
+	const lastSpace = cut.lastIndexOf(" ");
+	return (lastSpace > 0 ? cut.slice(0, lastSpace) : cut) + "\u2026";
+}
+
+/**
+ * Refresh the autocommit footer status (TUI/RPC only).
+ * Shows "paused" when suspended, otherwise clears the slot. The per-commit
+ * "\u2713 autocommit: <subject>" indicator is set directly after a successful
+ * commit and cleared again at the start of the next prompt (agent_start), so
+ * autocommit feedback lives in the footer, away from the conversation thread.
+ */
+function refreshStatus(ctx: ExtensionContext): void {
 	if (!ctx.hasUI) return;
-	if (enabled) {
-		ctx.ui.setStatus("autocommit", undefined);
-	} else {
+	if (!enabled) {
 		ctx.ui.setStatus("autocommit", ctx.ui.theme.fg("warning", "autocommit: paused"));
+	} else {
+		ctx.ui.setStatus("autocommit", undefined);
 	}
 }
 
@@ -223,7 +246,14 @@ export default function (pi: ExtensionAPI) {
 	// Load persisted state for this project on startup / session switch.
 	pi.on("session_start", async (_event, ctx) => {
 		enabled = await readState(ctx.cwd);
-		applyStatus(ctx);
+		refreshStatus(ctx);
+	});
+
+	// Clear the per-commit footer indicator at the start of the next prompt so
+	// the "\u2713 autocommit: ..." footer is transient and stays out of the
+	// conversation. Also re-asserts the paused indicator when suspended.
+	pi.on("agent_start", async (_event, ctx) => {
+		refreshStatus(ctx);
 	});
 
 	// Clear our footer status when the session runtime is torn down.
@@ -276,7 +306,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`autocommit: could not persist state — ${errMessage(err)}`, "error");
 				}
 			}
-			applyStatus(ctx);
+			refreshStatus(ctx);
 			if (ctx.hasUI) {
 				ctx.ui.notify(
 					`autocommit ${next ? "enabled" : "disabled (suspended)"} for ${ctx.cwd}`,
@@ -288,9 +318,10 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_end", async (event, ctx) => {
 		try {
-			// Suspended? Detect changes so we can warn the user that WIP is piling up,
-			// but never commit while suspended.
+			// Suspended? Re-assert the paused footer, detect changes so we can warn
+			// the user that WIP is piling up, but never commit while suspended.
 			if (!enabled) {
+				refreshStatus(ctx);
 				const rev = await git(pi, ["rev-parse", "--git-dir"], ctx);
 				if (rev.code !== 0) return;
 				const status = await git(pi, ["status", "--porcelain"], ctx);
@@ -399,7 +430,18 @@ export default function (pi: ExtensionAPI) {
 			const commit = await git(pi, commitArgs, ctx);
 
 			if (commit.code === 0) {
-				if (ctx.hasUI) ctx.ui.notify(`autocommit: ${subject}`, "info");
+				// Report success in the footer status line, away from the conversation
+				// thread (cleared on the next agent_start). Do NOT use an inline notify,
+				// so the autocommit flow does not clutter the main conversation.
+				if (ctx.hasUI) {
+					ctx.ui.setStatus(
+						"autocommit",
+						ctx.ui.theme.fg(
+							"success",
+							`\u2713 autocommit: ${truncateForFooter(subject, FOOTER_SUBJECT_MAX)}`,
+						),
+					);
+				}
 			} else if (ctx.hasUI) {
 				ctx.ui.notify(
 					`autocommit: commit failed — ${commit.stderr || commit.stdout || "unknown error"}`,

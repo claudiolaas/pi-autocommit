@@ -1,6 +1,6 @@
 {
   "name": "pi-autocommit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi extension that auto-commits all working-tree changes after each response, with a model-generated commit message. Includes a per-project /autocommit on/off toggle.",
   "keywords": ["pi-package", "pi-extension", "git", "autocommit"],
   "license": "MIT",

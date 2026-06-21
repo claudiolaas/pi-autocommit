@@ -68,7 +68,8 @@ Per-project state is stored at `<agentDir>/autocommit-state/<encoded-cwd>.json` 
 - **Conflicts:** Skips (and warns) on unresolved merge conflicts; never auto-resolves them.
 - **Non-git / clean tree:** Silent no-op.
 - **Commit message style:** Free-form descriptive (e.g. `Add input validation to the login form`), no Conventional Commits prefixes. Model output is sanitized: code fences, surrounding quotes, and preambles like "Here is the commit message:" are stripped. The subject is truncated to 72 chars at a word boundary with an ellipsis; the body to 1000 chars.
-- **Errors:** Never interrupt the agent. Commit failures and exceptions are surfaced as notifications.
+- **Stays out of the conversation:** The commit-message model call is a standalone call (`pi-ai` `complete()`) that does not touch the Pi session, so it never produces a visible agent turn. Successful commits are reported in the **footer status line** (`✓ autocommit: <subject>`), not as inline chat messages, and the indicator clears when you send your next prompt. This keeps the autocommit flow out of the main conversation thread.
+- **Errors / warnings:** Never interrupt the agent. Commit failures, exceptions, the suspended-with-pending-changes notice, and unresolved-conflict warnings are surfaced as inline notifications so they are not missed.
 
 ## License
 
