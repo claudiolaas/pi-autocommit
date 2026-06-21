@@ -23,6 +23,14 @@
  *   failures) still notify inline so they are not missed.
  * - Failures never interrupt the agent; they are surfaced via notifications.
  *
+ * Manual commands:
+ * - `/commit [message]`  commit all open changes now; if no message is given,
+ *                        auto-generate one from the diff (works regardless of
+ *                        the autocommit toggle).
+ * - `/undo`              revert the last commit with `git reset --soft HEAD~1`,
+ *                        bringing the changes back as uncommitted (and warns if
+ *                        autocommit is on, since they will re-commit next prompt).
+ *
  * Toggle (persisted per project):
  * - `/autocommit`            show current status
  * - `/autocommit on`         enable (default)
@@ -134,6 +142,130 @@ function refreshStatus(ctx: ExtensionContext): void {
 	}
 }
 
+/**
+ * Commit all open changes with a model-generated (or user-provided) message.
+ * Used by both the automatic `agent_end` hook and the manual `/commit` command.
+ *
+ * @param mode      "footer" — success in footer status (for autocommit hook);
+ *                  "notify" — success as inline notification (for /commit).
+ * @param userMsg   a user-supplied message; skips model generation when present.
+ * @param event     the agent_end event (for prompt/summary context); omitted by
+ *                  manual callers that do not have an event.
+ */
+async function commitNow(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	mode: "footer" | "notify",
+	userMsg?: string,
+	event?: { messages: AgentMessage[] },
+): Promise<{ ok: boolean; subject?: string; error?: string }> {
+	// Not inside a git repo — silent skip.
+	const rev = await git(pi, ["rev-parse", "--git-dir"], ctx);
+	if (rev.code !== 0) return { ok: false };
+
+	// Never auto-commit unresolved merge conflict markers.
+	const unmerged = await git(pi, ["diff", "--name-only", "--diff-filter=U"], ctx);
+	if (unmerged.stdout.trim().length > 0) {
+		if (ctx.hasUI) ctx.ui.notify("autocommit: unresolved merge conflicts — skipping", "warning");
+		return { ok: false, error: "conflict" };
+	}
+
+	// Stage all changes and confirm something is actually staged.
+	await git(pi, ["add", "-A"], ctx);
+	const status = await git(pi, ["diff", "--cached", "--name-only"], ctx);
+	if (status.stdout.trim().length === 0) return { ok: false, error: "clean" };
+
+	// Gather context for the model-based message generator.
+	const { prompt, summary } = event ? summarizeRun(event.messages) : { prompt: "", summary: "" };
+	const nameStatus = (await git(pi, ["diff", "--cached", "--name-status"], ctx)).stdout;
+	const rawDiff = (await git(pi, ["diff", "--cached"], ctx)).stdout;
+	const diff = truncateHead(rawDiff, { maxLines: DIFF_MAX_LINES, maxBytes: DIFF_MAX_BYTES }).content;
+
+	// Build or generate the commit message.
+	let message: string | undefined;
+	if (userMsg) {
+		message = userMsg;
+	} else {
+		// Try to generate a model-written commit message; fall back if unavailable.
+		if (ctx.model) {
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+			if (auth.ok && auth.apiKey) {
+				const systemPrompt = [
+					"You write git commit messages. Given the user's request, a summary of the work",
+					"done, the changed files, and a diff, write a concise, descriptive commit message",
+					"in plain language (free-form, no Conventional Commits prefixes like feat:/fix:).",
+					"",
+					"Rules:",
+					"- First line is the subject: a single line, at most 72 characters, imperative",
+					'  mood (e.g. "Add input validation to the login form").',
+					"- Optionally leave a blank line and add a short body explaining the why/what",
+					"  if it adds useful context.",
+					"- Output ONLY the commit message. No preamble, no explanation, no code fences,",
+					"  no surrounding quotes.",
+				].join("\n");
+
+				const userText = [
+					`User's request:\n${prompt || "(none)"}`,
+					"",
+					`What was done:\n${summary || "(no assistant summary)"}`,
+					"",
+					`Changed files (git --name-status):\n${nameStatus || "(none)"}`,
+					"",
+					`Diff (may be truncated):\n${diff || "(empty)"}`,
+				].join("\n");
+
+				const msgParam: Message = {
+					role: "user",
+					content: [{ type: "text", text: userText }],
+					timestamp: Date.now(),
+				};
+
+				try {
+					const response = await complete(
+						ctx.model,
+						{ systemPrompt, messages: [msgParam] },
+						{ apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal },
+					);
+					if (response.stopReason !== "aborted" && response.stopReason !== "error") {
+						message =
+							response.content
+								.filter((c): c is { type: "text"; text: string } => c.type === "text")
+								.map((c) => c.text)
+								.join("\n")
+								.trim() || undefined;
+					}
+				} catch {
+					/* fall back below */
+				}
+			}
+		}
+		if (!message) message = fallbackSubject(summary, nameStatus);
+	}
+
+	const cleaned = sanitizeCommitMessage(message);
+	const { subject, body } = splitSubjectBody(cleaned);
+	const commitArgs = body ? ["commit", "-m", subject, "-m", body] : ["commit", "-m", subject];
+	const commit = await git(pi, commitArgs, ctx);
+
+	if (commit.code === 0) {
+		// "footer" mode: success in the footer status (away from conversation).
+		// "notify" mode: success as an inline notification.
+		if (mode === "footer" && ctx.hasUI) {
+			ctx.ui.setStatus(
+				"autocommit",
+				ctx.ui.theme.fg("success", `\u2713 autocommit: ${truncateForFooter(subject, FOOTER_SUBJECT_MAX)}`),
+			);
+		} else if (mode === "notify" && ctx.hasUI) {
+			ctx.ui.notify(`autocommit: committed \u2014 ${subject}`, "info");
+		}
+		return { ok: true, subject };
+	}
+
+	const err = commit.stderr || commit.stdout || "unknown error";
+	if (ctx.hasUI) ctx.ui.notify(`autocommit: commit failed \u2014 ${err}`, "error");
+	return { ok: false, error: err };
+}
+
 function errMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
 }
@@ -197,7 +329,7 @@ export function sanitizeCommitMessage(raw: string): string {
 			first === "" ||
 			first.startsWith("here is") ||
 			first.startsWith("here's") ||
-			first.startsWith("here’s") ||
+			first.startsWith("here\u2019s") ||
 			first.startsWith("commit message") ||
 			first.startsWith("the commit message") ||
 			first.startsWith("this commit") ||
@@ -224,14 +356,14 @@ export function splitSubjectBody(cleaned: string): { subject: string; body: stri
 	if (subject.length > SUBJECT_MAX) {
 		const cut = subject.slice(0, SUBJECT_MAX - 1);
 		const lastSpace = cut.lastIndexOf(" ");
-		subject = (lastSpace > 0 ? cut.slice(0, lastSpace) : cut) + "…";
+		subject = (lastSpace > 0 ? cut.slice(0, lastSpace) : cut) + "\u2026";
 	}
 
 	const bodyText = lines
 		.slice(1)
 		.join("\n")
 		.trim();
-	const body = bodyText.length > BODY_MAX ? bodyText.slice(0, BODY_MAX - 1) + "…" : bodyText;
+	const body = bodyText.length > BODY_MAX ? bodyText.slice(0, BODY_MAX - 1) + "\u2026" : bodyText;
 	return { subject, body };
 }
 
@@ -239,7 +371,7 @@ export function splitSubjectBody(cleaned: string): { subject: string; body: stri
 export function fallbackSubject(summary: string, nameStatus: string): string {
 	const firstLine = summary.split("\n").find((l) => l.trim()) ?? "";
 	const base = firstLine || nameStatus || "Update files";
-	return base.length > SUBJECT_MAX ? base.slice(0, SUBJECT_MAX - 1) + "…" : base;
+	return base.length > SUBJECT_MAX ? base.slice(0, SUBJECT_MAX - 1) + "\u2026" : base;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -303,7 +435,7 @@ export default function (pi: ExtensionAPI) {
 				await writeState(ctx.cwd, next);
 			} catch (err) {
 				if (ctx.hasUI) {
-					ctx.ui.notify(`autocommit: could not persist state — ${errMessage(err)}`, "error");
+					ctx.ui.notify(`autocommit: could not persist state \u2014 ${errMessage(err)}`, "error");
 				}
 			}
 			refreshStatus(ctx);
@@ -316,10 +448,58 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// /commit [message] — stage everything and commit now; works regardless of
+	// the autocommit toggle. Uses model-generated message when no argument given.
+	pi.registerCommand("commit", {
+		description: "Commit all open changes now with an auto-generated (or explicit) message. Usage: /commit [message]",
+		handler: async (args, ctx) => {
+			const userMsg = args.trim();
+			const result = await commitNow(pi, ctx, "notify", userMsg || undefined);
+			if (!result.ok && result.error === "clean" && ctx.hasUI) {
+				ctx.ui.notify("autocommit: nothing to commit \u2014 working tree is clean", "warning");
+			}
+		},
+	});
+
+	// /undo — revert the last commit with `git reset --soft HEAD~1`, bringing
+	// changes back as uncommitted (staged). Warns if autocommit is on.
+	pi.registerCommand("undo", {
+		description: "Revert the last commit (soft reset), bringing changes back as uncommitted.",
+		handler: async (_args, ctx) => {
+			const head = await git(pi, ["rev-parse", "--verify", "HEAD"], ctx);
+			if (head.code !== 0) {
+				if (ctx.hasUI) ctx.ui.notify("autocommit: nothing to undo \u2014 no commits yet", "warning");
+				return;
+			}
+
+			const log = await git(pi, ["log", "-1", "--format=%s"], ctx);
+			const lastSubject = log.stdout.trim() || "(unknown)";
+
+			const reset = await git(pi, ["reset", "--soft", "HEAD~1"], ctx);
+			if (reset.code !== 0) {
+				if (ctx.hasUI) {
+					ctx.ui.notify(
+						`autocommit: undo failed \u2014 ${reset.stderr || reset.stdout || "unknown error"}`,
+						"error",
+					);
+				}
+				return;
+			}
+
+			if (ctx.hasUI) {
+				ctx.ui.notify(`autocommit: undid \u201c${lastSubject}\u201d \u2014 changes are back as uncommitted`, "info");
+				if (enabled) {
+					ctx.ui.notify(
+						"autocommit is on \u2014 the changes will be recommitted after your next prompt (use /autocommit off to prevent this)",
+						"warning",
+					);
+				}
+			}
+		},
+	});
+
 	pi.on("agent_end", async (event, ctx) => {
 		try {
-			// Suspended? Re-assert the paused footer, detect changes so we can warn
-			// the user that WIP is piling up, but never commit while suspended.
 			if (!enabled) {
 				refreshStatus(ctx);
 				const rev = await git(pi, ["rev-parse", "--git-dir"], ctx);
@@ -327,130 +507,15 @@ export default function (pi: ExtensionAPI) {
 				const status = await git(pi, ["status", "--porcelain"], ctx);
 				if (status.code === 0 && status.stdout.trim().length > 0) {
 					if (ctx.hasUI) {
-						ctx.ui.notify("autocommit: suspended — uncommitted changes left as-is", "warning");
+						ctx.ui.notify("autocommit: suspended \u2014 uncommitted changes left as-is", "warning");
 					}
 				}
 				return;
 			}
-
-			// Only operate inside a git repository.
-			const rev = await git(pi, ["rev-parse", "--git-dir"], ctx);
-			if (rev.code !== 0) return;
-
-			// Nothing to do if the working tree is clean.
-			const status = await git(pi, ["status", "--porcelain"], ctx);
-			if (status.code !== 0 || status.stdout.trim().length === 0) return;
-
-			// Never auto-commit unresolved merge conflicts.
-			const unmerged = await git(pi, ["diff", "--name-only", "--diff-filter=U"], ctx);
-			if (unmerged.stdout.trim().length > 0) {
-				if (ctx.hasUI) {
-					ctx.ui.notify("autocommit: unresolved merge conflicts — skipping", "warning");
-				}
-				return;
-			}
-
-			// Stage all changes, then confirm something is actually staged.
-			await git(pi, ["add", "-A"], ctx);
-			const staged = await git(pi, ["diff", "--cached", "--name-only"], ctx);
-			if (staged.stdout.trim().length === 0) return;
-
-			// Gather context for the commit message.
-			const { prompt, summary } = summarizeRun(event.messages);
-			const nameStatus = (await git(pi, ["diff", "--cached", "--name-status"], ctx)).stdout;
-			const rawDiff = (await git(pi, ["diff", "--cached"], ctx)).stdout;
-			const diff = truncateHead(rawDiff, {
-				maxLines: DIFF_MAX_LINES,
-				maxBytes: DIFF_MAX_BYTES,
-			}).content;
-
-			// Try to generate a model-written commit message; fall back if unavailable.
-			let message: string | undefined;
-			if (ctx.model) {
-				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
-				if (auth.ok && auth.apiKey) {
-					const systemPrompt = [
-						"You write git commit messages. Given the user's request, a summary of the work",
-						"done, the changed files, and a diff, write a concise, descriptive commit message",
-						"in plain language (free-form, no Conventional Commits prefixes like feat:/fix:).",
-						"",
-						"Rules:",
-						"- First line is the subject: a single line, at most 72 characters, imperative",
-						"  mood (e.g. \"Add input validation to the login form\").",
-						"- Optionally leave a blank line and add a short body explaining the why/what",
-						"  if it adds useful context.",
-						"- Output ONLY the commit message. No preamble, no explanation, no code fences,",
-						"  no surrounding quotes.",
-					].join("\n");
-
-					const userText = [
-						`User's request:\n${prompt || "(none)"}`,
-						"",
-						`What was done:\n${summary || "(no assistant summary)"}`,
-						"",
-						`Changed files (git --name-status):\n${nameStatus || "(none)"}`,
-						"",
-						`Diff (may be truncated):\n${diff || "(empty)"}`,
-					].join("\n");
-
-					const userMessage: Message = {
-						role: "user",
-						content: [{ type: "text", text: userText }],
-						timestamp: Date.now(),
-					};
-
-					try {
-						const response = await complete(
-							ctx.model,
-							{ systemPrompt, messages: [userMessage] },
-							{ apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal },
-						);
-						if (response.stopReason !== "aborted" && response.stopReason !== "error") {
-							message =
-								response.content
-									.filter(
-										(c): c is { type: "text"; text: string } => c.type === "text",
-									)
-									.map((c) => c.text)
-									.join("\n")
-									.trim() || undefined;
-						}
-					} catch {
-						/* fall back below */
-					}
-				}
-			}
-			if (!message) message = fallbackSubject(summary, nameStatus);
-
-			const cleaned = sanitizeCommitMessage(message);
-			const { subject, body } = splitSubjectBody(cleaned);
-			const commitArgs = body
-				? ["commit", "-m", subject, "-m", body]
-				: ["commit", "-m", subject];
-			const commit = await git(pi, commitArgs, ctx);
-
-			if (commit.code === 0) {
-				// Report success in the footer status line, away from the conversation
-				// thread (cleared on the next agent_start). Do NOT use an inline notify,
-				// so the autocommit flow does not clutter the main conversation.
-				if (ctx.hasUI) {
-					ctx.ui.setStatus(
-						"autocommit",
-						ctx.ui.theme.fg(
-							"success",
-							`\u2713 autocommit: ${truncateForFooter(subject, FOOTER_SUBJECT_MAX)}`,
-						),
-					);
-				}
-			} else if (ctx.hasUI) {
-				ctx.ui.notify(
-					`autocommit: commit failed — ${commit.stderr || commit.stdout || "unknown error"}`,
-					"error",
-				);
-			}
+			await commitNow(pi, ctx, "footer", undefined, event);
 		} catch (err) {
 			const msg = errMessage(err);
-			if (ctx.hasUI) ctx.ui.notify(`autocommit: error — ${msg}`, "error");
+			if (ctx.hasUI) ctx.ui.notify(`autocommit: error \u2014 ${msg}`, "error");
 		}
 	});
 }
